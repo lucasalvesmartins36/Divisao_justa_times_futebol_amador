@@ -1,3 +1,16 @@
+# Streamlit e deps
 streamlit>=1.37,<2
-pandas>=2.2
-openpyxl>=3.1
+
+# DataFrame
+pandas>=2.2,<3
+
+# Excel (para ler sua base local)
+openpyxl>=3.1,<4
+
+# Google Sheets (via service account)
+gspread>=6.1.2,<7
+google-auth>=2.33.0,<3
+
+# Auto refresh do front-end
+streamlit-autorefresh>=1.0.1,<2
+

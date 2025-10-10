@@ -1,11 +1,11 @@
 import streamlit as st
 import pandas as pd
-import io, time, os, sqlite3
+import io, time, os
 from datetime import datetime
 
-# =========================================
-# Config
-# =========================================
+# -----------------------------
+# Configuração geral
+# -----------------------------
 st.set_page_config(page_title="⚽ Pelada do Alpha — Inscrições & Times", layout="wide")
 
 # Limites
@@ -14,80 +14,105 @@ MAX_GOLEIRO = 2
 BASE_PATH = "./Lista Pelada.xlsx"        # caminho fixo na raiz do app
 SHEET_NAME = "Banco"                      # lê a aba 'Banco'
 
-# Estado compartilhado (SQLite)
-DB_PATH = "./state.db"
-
 # Rótulos dos times
 TIME_LABEL = {1: "Preto", 2: "Laranja"}
 TIME_EMOJI  = {"Preto": "⬛", "Laranja": "🟧"}
 
-# =========================================
-# Helpers de BD (estado compartilhado)
-# =========================================
-def init_db():
-    con = sqlite3.connect(DB_PATH, isolation_level=None, check_same_thread=False)
-    con.execute("""
-        CREATE TABLE IF NOT EXISTS inscritos(
-            nome TEXT PRIMARY KEY,
-            ts   INTEGER
-        )
-    """)
-    return con
+# -----------------------------
+# Autorefresh a cada 10s
+# -----------------------------
+from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=10_000, key="auto")
 
-def listar_inscritos(con) -> list[str]:
-    cur = con.execute("SELECT nome FROM inscritos ORDER BY nome COLLATE NOCASE")
-    return [r[0] for r in cur.fetchall()]
+# -----------------------------
+# Google Sheets (via Secrets)
+# -----------------------------
+import gspread
+from google.oauth2.service_account import Credentials
 
-def set_presenca(con, df_base: pd.DataFrame, nome: str, vai: bool) -> tuple[bool, str]:
-    """
-    Tenta aplicar a mudança de presença para 'nome' respeitando limites.
-    Retorna (ok, msg). Tudo ocorre em transação para evitar corrida.
-    """
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+@st.cache_resource
+def _get_ws():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(st.secrets["sheets"]["spreadsheet_key"])
+    ws = sh.worksheet(st.secrets["sheets"].get("worksheet_name", "inscritos"))
+    # garante cabeçalho nome|pos|ts
+    header = ws.row_values(1)
+    if [h.lower() for h in header] != ["nome", "pos", "ts"]:
+        ws.update("A1:C1", [["nome", "pos", "ts"]])
+    return ws
+
+@st.cache_data(ttl=10)
+def ler_inscritos_sheets() -> pd.DataFrame:
+    """Lê a aba 'inscritos' do Sheets (cache 10s por instância)."""
+    ws = _get_ws()
+    rows = ws.get_all_records()
+    df = pd.DataFrame(rows)
+    if df.empty:
+        df = pd.DataFrame(columns=["nome", "pos", "ts"])
+    return df
+
+def _upsert_inscrito(ws, nome: str, pos: str, ts: int):
+    """Atualiza (se existir) ou insere (se não existir) (nome, pos, ts)."""
     try:
-        con.execute("BEGIN IMMEDIATE")  # lock de escrita
-        # estado atual
-        atuais = set(n for (n,) in con.execute("SELECT nome FROM inscritos"))
-        # posição do jogador
-        pos_series = df_base.loc[df_base["Nome"] == nome, "Posição"]
-        if pos_series.empty:
-            con.execute("ROLLBACK")
-            return False, f"{nome}: não encontrado na base."
-        pos = normaliza_posicao(pos_series.iloc[0])
+        cell = ws.find(nome)  # procura o nome na planilha
+    except Exception:
+        cell = None
+    if cell:
+        ws.batch_update([{"range": f"B{cell.row}:C{cell.row}", "values": [[pos, ts]]}])
+    else:
+        ws.append_row([nome, pos, ts])
 
-        # contagem atual
-        d_count, a_count, g_count = contar_vagas(df_base, list(atuais))
+def _delete_inscrito(ws, nome: str):
+    try:
+        cell = ws.find(nome)
+        ws.delete_rows(cell.row)
+    except Exception:
+        pass
 
-        if vai and nome not in atuais:
-            if pos == "Goleiro":
-                if g_count >= MAX_GOLEIRO:
-                    con.execute("ROLLBACK")
-                    return False, f"{nome} (Goleiro — limite atingido)"
-                g_count += 1
+def set_presenca_sheet(df_base: pd.DataFrame, nome: str, vai: bool) -> tuple[bool, str]:
+    """Aplica mudança respeitando limites (linhas/goleiros) e grava no Sheets."""
+    ws = _get_ws()
+    df_atuais = ler_inscritos_sheets()
+    atuais = set(df_atuais["nome"].tolist())
+
+    # posição do jogador segundo a base
+    pos_series = df_base.loc[df_base["Nome"] == nome, "Posição"]
+    if pos_series.empty:
+        return False, f"{nome}: não encontrado na base."
+    pos = normaliza_posicao(pos_series.iloc[0])
+
+    # contagem atual para checar limites
+    d_count, a_count, g_count = contar_vagas(df_base, list(atuais))
+
+    if vai and nome not in atuais:
+        if pos == "Goleiro":
+            if g_count >= MAX_GOLEIRO:
+                return False, f"{nome} (Goleiro — limite atingido)"
+            g_count += 1
+        else:
+            if (d_count + a_count) >= MAX_LINHA:
+                lab = "Defesa" if pos == "Defesa" else "Ataque"
+                return False, f"{nome} ({lab} — limite de linha atingido)"
+            if pos == "Defesa":
+                d_count += 1
             else:
-                if (d_count + a_count) >= MAX_LINHA:
-                    lab = "Defesa" if pos == "Defesa" else "Ataque"
-                    con.execute("ROLLBACK")
-                    return False, f"{nome} ({lab} — limite de linha atingido)"
-                if pos == "Defesa":
-                    d_count += 1
-                else:
-                    a_count += 1
-            con.execute("INSERT OR IGNORE INTO inscritos(nome, ts) VALUES(?, ?)", (nome, int(time.time())))
-        elif (not vai) and nome in atuais:
-            con.execute("DELETE FROM inscritos WHERE nome = ?", (nome,))
-        # commit
-        con.execute("COMMIT")
-        return True, ""
-    except Exception as e:
-        try:
-            con.execute("ROLLBACK")
-        except:
-            pass
-        return False, f"Erro de concorrência/aplicação: {e}"
+                a_count += 1
+        _upsert_inscrito(ws, nome, pos, int(time.time()))
+    elif (not vai) and nome in atuais:
+        _delete_inscrito(ws, nome)
 
-# =========================================
-# Funções utilitárias (iguais às suas, com leves ajustes)
-# =========================================
+    # invalida o cache para que outras sessões vejam no próximo refresh
+    ler_inscritos_sheets.clear()
+    return True, ""
+
+# -----------------------------
+# Utilitários (seus originais)
+# -----------------------------
 def normaliza_posicao(valor: str) -> str:
     if not isinstance(valor, str):
         return "Ataque"
@@ -165,7 +190,7 @@ def logica_divide_times(df: pd.DataFrame) -> pd.DataFrame:
 
 def cria_download(df: pd.DataFrame, nome_arquivo: str = "Divisao_times.xlsx"):
     buffer = io.BytesIO()
-    cols = [c for c in df.columns if c != "Nota"]  # sem Nota no export
+    cols = [c for c in df.columns if c != "Nota"]
     df[cols].to_excel(buffer, index=False)
     buffer.seek(0)
     st.download_button("⬇️ Baixar divisão em Excel", data=buffer,
@@ -182,43 +207,32 @@ def indice_anonimo_equilibrio(df_times: pd.DataFrame) -> float:
         return 0.0
     return round(100.0 * (1.0 - abs(s_preto - s_laranja) / (total + eps)), 1)
 
-# =========================================
-# Inicializações
-# =========================================
-# auto-refresh a cada 5s para refletir mudanças de outras sessões
-from streamlit_autorefresh import st_autorefresh
-st_autorefresh(interval=5000, key="auto")  # 5000 ms = 5s
-
-
-# conexão compartilhada
-con = init_db()
-
-# =========================================
+# -----------------------------
 # Header
-# =========================================
+# -----------------------------
 st.title("⚽ Pelada do Alpha")
 
-# =========================================
-# Estado local (apenas flags de UI; inscritos vêm do BD)
-# =========================================
+# -----------------------------
+# Estado local (flags de UI)
+# -----------------------------
 if "df_base" not in st.session_state:
     st.session_state.df_base = None
 if "so_visual" not in st.session_state:
     st.session_state.so_visual = False
 
-# =========================================
-# Carrega base
-# =========================================
+# -----------------------------
+# Carrega base local (Excel)
+# -----------------------------
 if st.session_state.df_base is None:
     df_auto = carrega_base_local()
     if df_auto is not None:
         st.session_state.df_base = df_auto
 
-# =========================================
+# -----------------------------
 # Config do organizador
-# =========================================
+# -----------------------------
 with st.expander("⚙️ Configuração do organizador", expanded=False):
-    col_a, col_b, col_c = st.columns([1,1,1])
+    col_a, col_b = st.columns([1,1])
     with col_a:
         if st.button("🔄 Recarregar base do arquivo"):
             df_auto = carrega_base_local()
@@ -226,127 +240,129 @@ with st.expander("⚙️ Configuração do organizador", expanded=False):
                 st.session_state.df_base = df_auto
                 st.success("Base recarregada.")
     with col_b:
-        st.session_state.so_visual = st.toggle("Só visualizar (não aceitar novas inscrições)",
-                                               value=st.session_state.so_visual)
-    with col_c:
-        if st.button("🧹 Limpar inscrições (TODOS)"):
-            con.execute("DELETE FROM inscritos")
-            st.success("Presenças zeradas para todos.")
+        st.session_state.so_visual = st.toggle(
+            "Só visualizar (não aceitar novas inscrições)",
+            value=st.session_state.so_visual
+        )
 
-# =========================================
-# Check-in em TABELA (compartilhado)
-# =========================================
+# -----------------------------
+# Check-in em TABELA (compartilhado via Sheets)
+# -----------------------------
 st.subheader("📝 Check-in dos jogadores")
 
+# Fallback: se não houver Excel, ainda exibimos os inscritos do Sheets
 if st.session_state.df_base is None:
-    st.info("Coloque o arquivo `Lista Pelada.xlsx` na raiz do app (aba 'Banco').")
-else:
-    # inscritos compartilhados
-    inscritos_compart = listar_inscritos(con)
-
-    df_view = (
-        st.session_state.df_base[["Nome", "Posição"]]
-        .drop_duplicates()
-        .sort_values(by=["Nome"])
-        .reset_index(drop=True)
-    )
-    df_view["Vou"] = df_view["Nome"].isin(inscritos_compart)
-
-    d_count, a_count, g_count = contar_vagas(st.session_state.df_base, inscritos_compart)
-    c1, c2, c3 = st.columns([1,1,2])
-    with c1:
-        st.metric("Vagas Linha (Defesa+Ataque)", f"{d_count + a_count}/{MAX_LINHA}")
-    with c2:
-        st.metric("Vagas Goleiro", f"{g_count}/{MAX_GOLEIRO}")
-    with c3:
-        restantes = max(0, MAX_LINHA - (d_count + a_count)) + max(0, MAX_GOLEIRO - g_count)
-        st.info(f"Restam **{restantes}** vagas (linha + goleiro).")
-
-    edited = st.data_editor(
-        df_view,
-        use_container_width=True,
-        hide_index=True,
-        disabled=st.session_state.so_visual,
-        column_config={
-            "Nome": st.column_config.TextColumn("Nome", disabled=True),
-            "Posição": st.column_config.TextColumn("Posição", disabled=True),
-            "Vou": st.column_config.CheckboxColumn("Vou", help="Marque para confirmar presença"),
-        },
-        key="checkin_table_shared"
-    )
-
-    # aplica diferenças nome a nome em transação para respeitar limites
-    if not st.session_state.so_visual:
-        desired_set = set(edited.loc[edited["Vou"], "Nome"].tolist())
-        current_set = set(inscritos_compart)
-        mudancas = sorted(desired_set.symmetric_difference(current_set))
-        recusados = []
-        for nome in mudancas:
-            quer_ir = nome in desired_set
-            ok, msg = set_presenca(con, st.session_state.df_base, nome, quer_ir)
-            if not ok and msg:
-                recusados.append(msg)
-        if mudancas:
-            if recusados:
-                st.warning("Alguns jogadores não puderam ser confirmados:\n- " + "\n- ".join(recusados))
-            else:
-                st.toast("Presenças atualizadas.", icon="✅")
-            st.rerun()
-
-
-# =========================================
-# Divisão de times (compartilhada)
-# =========================================
-st.subheader("🧮 Divisão de Times")
-if st.session_state.df_base is None:
-    st.info("Carregue o arquivo base para ver os times.")
-else:
-    inscritos_compart = listar_inscritos(con)
-    df_inscritos = st.session_state.df_base[
-        st.session_state.df_base["Nome"].isin(inscritos_compart)
-    ].copy()
-
-    if not df_inscritos.empty:
-        df_times = logica_divide_times(df_inscritos)
-
-        # Índice anônimo de equilíbrio (0–100; maior = mais equilibrado)
-        score = indice_anonimo_equilibrio(df_times)
-        mensagem = "Times equilibrados" if score >= 80 else ("Leve vantagem para um dos lados" if score >= 60 else "Desequilíbrio notável")
-        st.metric("Índice anônimo de equilíbrio (0–100)", f"{score}", help="Calculado só com agregados; não revela notas individuais.")
-        st.caption(f"_Leitura rápida_: {mensagem}.")
-
-        # Resumo por time: contagem por posição
-        contagem_pos = (
-            df_times.groupby(["Equipe", "Posição"]).size()
-                    .unstack(fill_value=0).reset_index()
-        )
-        for c in ["Goleiro", "Defesa", "Ataque"]:
-            if c not in contagem_pos.columns:
-                contagem_pos[c] = 0
-        contagem_pos["ord"] = contagem_pos["Equipe"].map({"Preto": 0, "Laranja": 1})
-        contagem_pos = contagem_pos.sort_values("ord").drop(columns=["ord"])
-        st.caption("**Resumo por time (contagem por posição):**")
-        st.dataframe(contagem_pos[["Equipe", "Goleiro", "Defesa", "Ataque"]],
-                     hide_index=True, use_container_width=True)
-
-        # Listas dos times (ordem alfabética por Nome)
-        col1, col2 = st.columns(2)
-        for equipe, col in zip(["Preto", "Laranja"], [col1, col2]):
-            emoji = TIME_EMOJI.get(equipe, "")
-            col.markdown(f"### {emoji} Time {equipe}")
-            bloc = df_times[df_times["Equipe"] == equipe].copy()
-            if bloc.empty:
-                col.info("_Sem jogadores ainda._")
-            else:
-                bloc = bloc.sort_values(by=["Nome"])
-                col.dataframe(bloc[["Nome", "Posição"]], hide_index=True, use_container_width=True)
-
-        # Download Excel (sem Nota, com 'Equipe')
-        cria_download(df_times, "Divisao_times.xlsx")
+    st.warning("Base Excel não carregada. Exibindo apenas inscritos do Google Sheets.")
+    df_inscritos_sheet = ler_inscritos_sheets()
+    if df_inscritos_sheet.empty:
+        st.info("Ainda não há inscritos salvos.")
     else:
-        st.info("Ainda não há inscritos para dividir os times.")
+        st.dataframe(
+            df_inscritos_sheet[["nome", "pos"]].rename(columns={"nome": "Nome", "pos": "Posição"}),
+            hide_index=True, use_container_width=True
+        )
+    st.stop()
 
-# =========================================
+# Com base local, a UI completa:
+df_base = st.session_state.df_base
+df_sheet = ler_inscritos_sheets()
+inscritos_compart = df_sheet["nome"].tolist()
+
+df_view = (
+    df_base[["Nome", "Posição"]]
+    .drop_duplicates()
+    .sort_values(by=["Nome"])
+    .reset_index(drop=True)
+)
+df_view["Vou"] = df_view["Nome"].isin(inscritos_compart)
+
+d_count, a_count, g_count = contar_vagas(df_base, inscritos_compart)
+c1, c2, c3 = st.columns([1,1,2])
+with c1:
+    st.metric("Vagas Linha (Defesa+Ataque)", f"{d_count + a_count}/{MAX_LINHA}")
+with c2:
+    st.metric("Vagas Goleiro", f"{g_count}/{MAX_GOLEIRO}")
+with c3:
+    restantes = max(0, MAX_LINHA - (d_count + a_count)) + max(0, MAX_GOLEIRO - g_count)
+    st.info(f"Restam **{restantes}** vagas (linha + goleiro).")
+
+edited = st.data_editor(
+    df_view,
+    use_container_width=True,
+    hide_index=True,
+    disabled=st.session_state.so_visual,
+    column_config={
+        "Nome": st.column_config.TextColumn("Nome", disabled=True),
+        "Posição": st.column_config.TextColumn("Posição", disabled=True),
+        "Vou": st.column_config.CheckboxColumn("Vou", help="Marque para confirmar presença"),
+    },
+    key="checkin_table_shared"
+)
+
+# aplica apenas diferenças (debounce de escrita)
+if not st.session_state.so_visual:
+    desired_set  = set(edited.loc[edited["Vou"], "Nome"].tolist())
+    current_set  = set(inscritos_compart)
+    mudancas     = sorted(desired_set.symmetric_difference(current_set))
+    recusados    = []
+    for nome in mudancas:
+        quer_ir = nome in desired_set
+        ok, msg = set_presenca_sheet(df_base, nome, quer_ir)
+        if not ok and msg:
+            recusados.append(msg)
+    if mudancas:
+        if recusados:
+            st.warning("Alguns jogadores não puderam ser confirmados:\n- " + "\n- ".join(recusados))
+        else:
+            st.toast("Presenças atualizadas.", icon="✅")
+        st.rerun()
+
+# -----------------------------
+# Divisão de times (compartilhada)
+# -----------------------------
+st.subheader("🧮 Divisão de Times")
+
+df_sheet = ler_inscritos_sheets()  # (cache ≤10s)
+inscritos_compart = df_sheet["nome"].tolist()
+df_inscritos = df_base[df_base["Nome"].isin(inscritos_compart)].copy()
+
+if not df_inscritos.empty:
+    df_times = logica_divide_times(df_inscritos)
+
+    score = indice_anonimo_equilibrio(df_times)
+    mensagem = "Times equilibrados" if score >= 80 else ("Leve vantagem para um dos lados" if score >= 60 else "Desequilíbrio notável")
+    st.metric("Índice anônimo de equilíbrio (0–100)", f"{score}", help="Calculado só com agregados; não revela notas individuais.")
+    st.caption(f"_Leitura rápida_: {mensagem}.")
+
+    contagem_pos = (
+        df_times.groupby(["Equipe", "Posição"]).size()
+                .unstack(fill_value=0).reset_index()
+    )
+    for c in ["Goleiro", "Defesa", "Ataque"]:
+        if c not in contagem_pos.columns:
+            contagem_pos[c] = 0
+    contagem_pos["ord"] = contagem_pos["Equipe"].map({"Preto": 0, "Laranja": 1})
+    contagem_pos = contagem_pos.sort_values("ord").drop(columns=["ord"])
+    st.caption("**Resumo por time (contagem por posição):**")
+    st.dataframe(contagem_pos[["Equipe", "Goleiro", "Defesa", "Ataque"]],
+                 hide_index=True, use_container_width=True)
+
+    col1, col2 = st.columns(2)
+    for equipe, col in zip(["Preto", "Laranja"], [col1, col2]):
+        emoji = TIME_EMOJI.get(equipe, "")
+        col.markdown(f"### {emoji} Time {equipe}")
+        bloc = df_times[df_times["Equipe"] == equipe].copy()
+        if bloc.empty:
+            col.info("_Sem jogadores ainda._")
+        else:
+            bloc = bloc.sort_values(by=["Nome"])
+            col.dataframe(bloc[["Nome", "Posição"]], hide_index=True, use_container_width=True)
+
+    cria_download(df_times, "Divisao_times.xlsx")
+else:
+    st.info("Ainda não há inscritos para dividir os times.")
+
+# -----------------------------
 # Rodapé
-# =========================================
+# -----------------------------
 st.markdown("---")
