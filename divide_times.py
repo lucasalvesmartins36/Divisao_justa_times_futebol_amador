@@ -22,7 +22,7 @@ TIME_EMOJI  = {"Preto": "⬛", "Laranja": "🟧"}
 # Autorefresh a cada 10s
 # -----------------------------
 from streamlit_autorefresh import st_autorefresh
-st_autorefresh(interval=10_000, key="auto")
+st_autorefresh(interval=30_000, key="auto")
 
 # -----------------------------
 # Google Sheets (via Secrets)
