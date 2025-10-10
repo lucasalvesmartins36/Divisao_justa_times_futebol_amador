@@ -2,6 +2,8 @@ import streamlit as st
 import pandas as pd
 import io, time, os
 from datetime import datetime
+import random
+
 
 # -----------------------------
 # Configuração geral
@@ -159,34 +161,52 @@ def carrega_base_local() -> pd.DataFrame | None:
         st.error(f"Erro ao ler '{BASE_PATH}' (aba '{SHEET_NAME}'): {e}")
         return None
 
-def logica_divide_times(df: pd.DataFrame) -> pd.DataFrame:
+def logica_divide_times(df: pd.DataFrame, seed: int | None = None) -> pd.DataFrame:
+    """
+    Divide times por (Posição, Nota) com embaralhamento:
+    - Embaralha a ORDEM dos grupos (Posição, Nota) para evitar viés.
+    - Embaralha a ORDEM dos nomes dentro do grupo (opcional, já incluso).
+    - Mantém a regra de alternar quem recebe 1 a mais quando o grupo é ímpar.
+    """
     df = df.copy()
-    df["Grupo"] = df.groupby(["Posição", "Nota"]).ngroup()
-    df["Time"] = 0
-    dfs = []
-    pref_time1 = True
-    for grupo in df["Grupo"].drop_duplicates():
-        df_grupo = df[df["Grupo"] == grupo].reset_index(drop=True)
+
+    # 1) Liste os grupos (Posição, Nota) e EMBARALHE a ordem dos grupos
+    grupos = list(df.groupby(["Posição", "Nota"]).groups.keys())
+    rng = random.Random(seed) if seed is not None else random
+    rng.shuffle(grupos)
+
+    registros = []
+    pref_time1 = True  # alterna quem recebe 1 extra em grupos ímpares
+
+    for pos, nota in grupos:
+        df_grupo = df[(df["Posição"] == pos) & (df["Nota"] == nota)].copy()
+
+        # 2) (Opcional) Embaralhe os nomes dentro do grupo
+        #    Usamos um random_state variável para não fixar a mesma ordem sempre quando seed=None
+        df_grupo = df_grupo.sample(frac=1, random_state=rng.randint(0, 2**32 - 1)).reset_index(drop=True)
+
         n = len(df_grupo)
         if n % 2 == 0:
-            metade = int(n/2) - 1
-            df_grupo.loc[0:metade, "Time"] = 1
-            df_grupo.loc[metade+1:n, "Time"] = 2
+            metade = n // 2
+            df_grupo.loc[:metade-1, "Time"] = 1
+            df_grupo.loc[metade:,   "Time"] = 2
         else:
-            parte_maior = int((n+1)/2 - 1)
+            parte_maior = (n + 1) // 2
             if pref_time1:
-                df_grupo.loc[0:parte_maior, "Time"] = 1
-                df_grupo.loc[parte_maior+1:n, "Time"] = 2
-                pref_time1 = False
+                df_grupo.loc[:parte_maior-1, "Time"] = 1
+                df_grupo.loc[parte_maior:,   "Time"] = 2
             else:
-                df_grupo.loc[0:parte_maior, "Time"] = 2
-                df_grupo.loc[parte_maior+1:n, "Time"] = 1
-                pref_time1 = True
-        dfs.append(df_grupo)
-    df_final = pd.concat(dfs, ignore_index=True)
+                df_grupo.loc[:parte_maior-1, "Time"] = 2
+                df_grupo.loc[parte_maior:,   "Time"] = 1
+            pref_time1 = not pref_time1
+
+        registros.append(df_grupo)
+
+    df_final = pd.concat(registros, ignore_index=True)
     df_final.sort_values(by=["Time", "Posição", "Nota"], ascending=[True, True, False], inplace=True)
     df_final["Equipe"] = df_final["Time"].map(TIME_LABEL)
     return df_final
+
 
 def cria_download(df: pd.DataFrame, nome_arquivo: str = "Divisao_times.xlsx"):
     buffer = io.BytesIO()
