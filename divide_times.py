@@ -207,6 +207,20 @@ def indice_anonimo_equilibrio(df_times: pd.DataFrame) -> float:
         return 0.0
     return round(100.0 * (1.0 - abs(s_preto - s_laranja) / (total + eps)), 1)
 
+def limpar_inscritos_sheets():
+    ws = _get_ws()
+    # limpa todo o conteúdo abaixo do cabeçalho (A2:C)
+    try:
+        last_row = len(ws.get_all_values())
+        if last_row > 1:
+            ws.batch_clear([f"A2:C{last_row}"])
+    except Exception:
+        # fallback: garante que ao menos o cabeçalho fica
+        ws.update("A1:C1", [["nome","pos","ts"]])
+    # invalida cache e força nova leitura no próximo rerun
+    ler_inscritos_sheets.clear()
+
+
 # -----------------------------
 # Header
 # -----------------------------
@@ -232,18 +246,30 @@ if st.session_state.df_base is None:
 # Config do organizador
 # -----------------------------
 with st.expander("⚙️ Configuração do organizador", expanded=False):
-    col_a, col_b = st.columns([1,1])
+    col_a, col_b, col_c = st.columns([1, 1, 1])
+
+    # Recarregar a base Excel
     with col_a:
         if st.button("🔄 Recarregar base do arquivo"):
             df_auto = carrega_base_local()
             if df_auto is not None:
                 st.session_state.df_base = df_auto
                 st.success("Base recarregada.")
+
+    # Travar/destravar check-ins (modo visualização)
     with col_b:
         st.session_state.so_visual = st.toggle(
             "Só visualizar (não aceitar novas inscrições)",
             value=st.session_state.so_visual
         )
+
+    # LIMPAR inscritos no Google Sheets
+    with col_c:
+        if st.button("🧹 Limpar inscritos (Sheets)"):
+            limpar_inscritos_sheets()     # <- chama o helper que limpa A2:C...
+            st.success("Inscritos limpos para a próxima pelada.")
+            st.rerun()
+
 
 # -----------------------------
 # Check-in em TABELA (compartilhado via Sheets)
