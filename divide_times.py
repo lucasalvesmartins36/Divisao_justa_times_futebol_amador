@@ -4,6 +4,8 @@ import io, time, os
 from datetime import datetime
 import random
 
+SEED_FIXA = 20251015  # escolha qualquer inteiro; troque se quiser um novo "sorteio" reprodutível
+
 
 # -----------------------------
 # Configuração geral
@@ -162,27 +164,25 @@ def carrega_base_local() -> pd.DataFrame | None:
         return None
 
 def logica_divide_times(df: pd.DataFrame, seed: int | None = None) -> pd.DataFrame:
-    """
-    Divide times por (Posição, Nota) com embaralhamento:
-    - Embaralha a ORDEM dos grupos (Posição, Nota) para evitar viés.
-    - Embaralha a ORDEM dos nomes dentro do grupo (opcional, já incluso).
-    - Mantém a regra de alternar quem recebe 1 a mais quando o grupo é ímpar.
-    """
     df = df.copy()
-
-    # 1) Liste os grupos (Posição, Nota) e EMBARALHE a ordem dos grupos
-    grupos = list(df.groupby(["Posição", "Nota"]).groups.keys())
     rng = random.Random(seed) if seed is not None else random
+    registros = []
+
+    # 1) Distribui GOLEIROS primeiro: 1,2,1,2... (diferença máxima = 1)
+    df_gk = df[df["Posição"] == "Goleiro"].copy()
+    if not df_gk.empty:
+        df_gk = df_gk.sample(frac=1, random_state=rng.randint(0, 2**32 - 1)).reset_index(drop=True)
+        df_gk["Time"] = [1 if i % 2 == 0 else 2 for i in range(len(df_gk))]
+        registros.append(df_gk)
+
+    # 2) Divide os demais (Defesa/Ataque) como já fazia
+    df_rest = df[df["Posição"] != "Goleiro"].copy()
+    grupos = list(df_rest.groupby(["Posição", "Nota"]).groups.keys())
     rng.shuffle(grupos)
 
-    registros = []
     pref_time1 = True  # alterna quem recebe 1 extra em grupos ímpares
-
     for pos, nota in grupos:
-        df_grupo = df[(df["Posição"] == pos) & (df["Nota"] == nota)].copy()
-
-        # 2) (Opcional) Embaralhe os nomes dentro do grupo
-        #    Usamos um random_state variável para não fixar a mesma ordem sempre quando seed=None
+        df_grupo = df_rest[(df_rest["Posição"] == pos) & (df_rest["Nota"] == nota)].copy()
         df_grupo = df_grupo.sample(frac=1, random_state=rng.randint(0, 2**32 - 1)).reset_index(drop=True)
 
         n = len(df_grupo)
@@ -202,7 +202,7 @@ def logica_divide_times(df: pd.DataFrame, seed: int | None = None) -> pd.DataFra
 
         registros.append(df_grupo)
 
-    df_final = pd.concat(registros, ignore_index=True)
+    df_final = pd.concat(registros, ignore_index=True) if registros else df.copy()
     df_final.sort_values(by=["Time", "Posição", "Nota"], ascending=[True, True, False], inplace=True)
     df_final["Equipe"] = df_final["Time"].map(TIME_LABEL)
     return df_final
@@ -373,7 +373,7 @@ inscritos_compart = df_sheet["nome"].tolist()
 df_inscritos = df_base[df_base["Nome"].isin(inscritos_compart)].copy()
 
 if not df_inscritos.empty:
-    df_times = logica_divide_times(df_inscritos)
+    df_times = logica_divide_times(df_inscritos, seed=SEED_FIXA)
 
     score = indice_anonimo_equilibrio(df_times)
     mensagem = "Times equilibrados" if score >= 80 else ("Leve vantagem para um dos lados" if score >= 60 else "Desequilíbrio notável")
