@@ -10,7 +10,7 @@ SEED_FIXA = 20251015  # escolha qualquer inteiro; troque se quiser um novo "sort
 # -----------------------------
 # Configuração geral
 # -----------------------------
-st.set_page_config(page_title="⚽ Pelada do Alpha — Inscrições & Times", layout="wide")
+st.set_page_config(page_title="⚽ Fut Alpha — Inscrições & Times", layout="wide")
 
 # Limites
 MAX_LINHA = 18          # Defesa + Ataque
