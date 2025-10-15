@@ -244,7 +244,7 @@ def limpar_inscritos_sheets():
 # -----------------------------
 # Header
 # -----------------------------
-st.title("⚽ Pelada do Alpha")
+st.title("⚽ Fut Alpha")
 
 # -----------------------------
 # Estado local (flags de UI)
