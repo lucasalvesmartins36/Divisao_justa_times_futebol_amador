@@ -22,6 +22,36 @@ SHEET_NAME = "Banco"                      # lê a aba 'Banco'
 TIME_LABEL = {1: "Preto", 2: "Laranja"}
 TIME_EMOJI  = {"Preto": "⬛", "Laranja": "🟧"}
 
+
+from datetime import datetime
+
+def _get_ws_log():
+    creds = Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"], scopes=SCOPES
+    )
+    gc = gspread.authorize(creds)
+    sh = gc.open_by_key(st.secrets["sheets"]["spreadsheet_key"])
+    title = st.secrets["sheets"].get("worksheet_log_name", "log")
+    try:
+        wslog = sh.worksheet(title)
+    except Exception:
+        wslog = sh.add_worksheet(title=title, rows=1000, cols=5)
+        wslog.update("A1:E1", [["ts","acao","nome","pos","origem"]])
+        return wslog
+    header = wslog.row_values(1)
+    if [h.lower() for h in header] != ["ts","acao","nome","pos","origem"]:
+        wslog.update("A1:E1", [["ts","acao","nome","pos","origem"]])
+    return wslog
+
+def _append_log(acao: str, nome: str, pos: str, origem: str = "app"):
+    try:
+        wslog = _get_ws_log()
+        ts_iso = datetime.now().isoformat(timespec="seconds")
+        wslog.append_row([ts_iso, acao, nome, pos, origem])
+    except Exception:
+        pass  # não quebra a UI se o log falhar
+
+
 # -----------------------------
 # Autorefresh a cada 10s
 # -----------------------------
@@ -107,8 +137,10 @@ def set_presenca_sheet(df_base: pd.DataFrame, nome: str, vai: bool) -> tuple[boo
             else:
                 a_count += 1
         _upsert_inscrito(ws, nome, pos, int(time.time()))
+        _append_log("ADD", nome, pos, origem="app")
     elif (not vai) and nome in atuais:
         _delete_inscrito(ws, nome)
+        _append_log("REM", nome, pos, origem="app")
 
     # invalida o cache para que outras sessões vejam no próximo refresh
     ler_inscritos_sheets.clear()
