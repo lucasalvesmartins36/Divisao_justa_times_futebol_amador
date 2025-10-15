@@ -200,39 +200,58 @@ def logica_divide_times(df: pd.DataFrame, seed: int | None = None) -> pd.DataFra
     rng = random.Random(seed) if seed is not None else random
     registros = []
 
-    # 1) Distribui GOLEIROS primeiro: 1,2,1,2... (diferença máxima = 1)
+    # 1) GOLEIROS: 1,2,1,2...
     df_gk = df[df["Posição"] == "Goleiro"].copy()
     if not df_gk.empty:
         df_gk = df_gk.sample(frac=1, random_state=rng.randint(0, 2**32 - 1)).reset_index(drop=True)
         df_gk["Time"] = [1 if i % 2 == 0 else 2 for i in range(len(df_gk))]
         registros.append(df_gk)
 
-    # 2) Divide os demais (Defesa/Ataque) como já fazia
+    # saldo de goleiros para decidir quem recebe o primeiro "extra" do restante
+    diff_g = 0
+    if not df_gk.empty:
+        g1 = int((df_gk["Time"] == 1).sum())
+        g2 = int((df_gk["Time"] == 2).sum())
+        diff_g = g1 - g2  # +1: time 1 tem 1 goleiro a mais; -1: time 2 tem 1 a mais
+
+    # 2) RESTANTE com alternador GLOBAL (Defesa → Ataque)
     df_rest = df[df["Posição"] != "Goleiro"].copy()
-    grupos = list(df_rest.groupby(["Posição", "Nota"]).groups.keys())
-    rng.shuffle(grupos)
 
-    pref_time1 = True  # alterna quem recebe 1 extra em grupos ímpares
-    for pos, nota in grupos:
-        df_grupo = df_rest[(df_rest["Posição"] == pos) & (df_rest["Nota"] == nota)].copy()
-        df_grupo = df_grupo.sample(frac=1, random_state=rng.randint(0, 2**32 - 1)).reset_index(drop=True)
+    # Se um time iniciou com +1 goleiro, o primeiro extra vai para o outro time.
+    pref_time1 = True
+    if diff_g > 0:   # time 1 na frente
+        pref_time1 = False
+    elif diff_g < 0: # time 2 na frente
+        pref_time1 = True
 
-        n = len(df_grupo)
-        if n % 2 == 0:
-            metade = n // 2
-            df_grupo.loc[:metade-1, "Time"] = 1
-            df_grupo.loc[metade:,   "Time"] = 2
-        else:
-            parte_maior = (n + 1) // 2
-            if pref_time1:
-                df_grupo.loc[:parte_maior-1, "Time"] = 1
-                df_grupo.loc[parte_maior:,   "Time"] = 2
+    for pos in ["Defesa", "Ataque"]:
+        df_pos = df_rest[df_rest["Posição"] == pos].copy()
+        if df_pos.empty:
+            continue
+
+        notas = list(df_pos["Nota"].unique())
+        rng.shuffle(notas)  # evita viés de ordenação
+
+        for nota in notas:
+            df_grupo = df_pos[df_pos["Nota"] == nota].copy()
+            df_grupo = df_grupo.sample(frac=1, random_state=rng.randint(0, 2**32 - 1)).reset_index(drop=True)
+
+            n = len(df_grupo)
+            if n % 2 == 0:
+                m = n // 2
+                df_grupo.loc[:m-1, "Time"] = 1
+                df_grupo.loc[m:,   "Time"] = 2
             else:
-                df_grupo.loc[:parte_maior-1, "Time"] = 2
-                df_grupo.loc[parte_maior:,   "Time"] = 1
-            pref_time1 = not pref_time1
+                m = n // 2 + 1  # parte maior
+                if pref_time1:
+                    df_grupo.loc[:m-1, "Time"] = 1
+                    df_grupo.loc[m:,   "Time"] = 2
+                else:
+                    df_grupo.loc[:m-1, "Time"] = 2
+                    df_grupo.loc[m:,   "Time"] = 1
+                pref_time1 = not pref_time1  # alternância GLOBAL
 
-        registros.append(df_grupo)
+            registros.append(df_grupo)
 
     df_final = pd.concat(registros, ignore_index=True) if registros else df.copy()
     df_final.sort_values(by=["Time", "Posição", "Nota"], ascending=[True, True, False], inplace=True)
@@ -409,8 +428,31 @@ if not df_inscritos.empty:
 
     score = indice_anonimo_equilibrio(df_times)
     mensagem = "Times equilibrados" if score >= 80 else ("Leve vantagem para um dos lados" if score >= 60 else "Desequilíbrio notável")
-    st.metric("Índice anônimo de equilíbrio (0–100)", f"{score}", help="Calculado só com agregados; não revela notas individuais.")
+    st.metric(
+    "Índice anônimo de equilíbrio (0–100)",
+    f"{score}",
+    help=(" **Como calculamos o índice de equilíbrio (0–100):** "
+        "Sejam $S_\\text{preto}$ e $S_\\text{laranja}$ as somas das *Notas* dos jogadores de cada time. "
+        "Calculamos `Índice = 100 × (1 − |S_preto − S_laranja| / (S_preto + S_laranja))`. "
+        "Quanto mais próximo de **100**, mais equilibrados os times; valores menores indicam maior diferença."
+        )
+    )
+    
     st.caption(f"_Leitura rápida_: {mensagem}.")
+
+    col1, col2 = st.columns(2)
+    for equipe, col in zip(["Preto", "Laranja"], [col1, col2]):
+        emoji = TIME_EMOJI.get(equipe, "")
+        col.markdown(f"### {emoji} Time {equipe}")
+        bloc = df_times[df_times["Equipe"] == equipe].copy()
+        if bloc.empty:
+            col.info("_Sem jogadores ainda._")
+        else:
+            # ordem desejada de exibição
+            _pos_ord = {"Goleiro": 0, "Defesa": 1, "Ataque": 2}
+            bloc["__pos_ord"] = bloc["Posição"].map(_pos_ord).fillna(99).astype(int)
+            bloc = bloc.sort_values(by=["__pos_ord", "Nome"]).drop(columns=["__pos_ord"])
+            col.dataframe(bloc[["Nome", "Posição"]], hide_index=True, use_container_width=True)
 
     contagem_pos = (
         df_times.groupby(["Equipe", "Posição"]).size()
@@ -424,17 +466,6 @@ if not df_inscritos.empty:
     st.caption("**Resumo por time (contagem por posição):**")
     st.dataframe(contagem_pos[["Equipe", "Goleiro", "Defesa", "Ataque"]],
                  hide_index=True, use_container_width=True)
-
-    col1, col2 = st.columns(2)
-    for equipe, col in zip(["Preto", "Laranja"], [col1, col2]):
-        emoji = TIME_EMOJI.get(equipe, "")
-        col.markdown(f"### {emoji} Time {equipe}")
-        bloc = df_times[df_times["Equipe"] == equipe].copy()
-        if bloc.empty:
-            col.info("_Sem jogadores ainda._")
-        else:
-            bloc = bloc.sort_values(by=["Nome"])
-            col.dataframe(bloc[["Nome", "Posição"]], hide_index=True, use_container_width=True)
 
     cria_download(df_times, "Divisao_times.xlsx")
 else:
