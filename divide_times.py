@@ -6,7 +6,6 @@ import random
 
 SEED_FIXA = 20251015  # escolha qualquer inteiro; troque se quiser um novo "sorteio" reprodutível
 
-
 # -----------------------------
 # Configuração geral
 # -----------------------------
@@ -15,22 +14,72 @@ st.set_page_config(page_title="⚽ Fut Alpha — Inscrições & Times", layout="
 # Limites
 MAX_LINHA = 18          # Defesa + Ataque
 MAX_GOLEIRO = 2
-BASE_PATH = "./Lista Pelada.xlsx"        # caminho fixo na raiz do app
-SHEET_NAME = "Banco"                      # lê a aba 'Banco'
+SHEET_NAME = "Banco"    # nome padrão da aba base; sobrescrito por secrets (worksheet_base_name)
 
 # Rótulos dos times
 TIME_LABEL = {1: "Preto", 2: "Laranja"}
 TIME_EMOJI  = {"Preto": "⬛", "Laranja": "🟧"}
 
-
 from datetime import datetime
 
-def _get_ws_log():
+# -----------------------------
+# Google Sheets (via gspread)
+# -----------------------------
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Escopo com permissão de leitura/escrita (usa-se para check-in e log também)
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def _expect_secret(path: str):
+    """Helper para mensagens de erro de secrets ausentes."""
+    st.error(f"Secret `{path}` não encontrado. Configure em Settings → Secrets do Streamlit.")
+    st.stop()
+
+def _get_spreadsheet():
+    if "gcp_service_account" not in st.secrets:
+        _expect_secret("gcp_service_account")
+    if "sheets" not in st.secrets or "spreadsheet_key" not in st.secrets["sheets"]:
+        _expect_secret("sheets.spreadsheet_key")
+
     creds = Credentials.from_service_account_info(
         st.secrets["gcp_service_account"], scopes=SCOPES
     )
     gc = gspread.authorize(creds)
-    sh = gc.open_by_key(st.secrets["sheets"]["spreadsheet_key"])
+    return gc.open_by_key(st.secrets["sheets"]["spreadsheet_key"])
+
+@st.cache_resource
+def _get_ws_base():
+    """Worksheet da base (aba Banco)."""
+    sh = _get_spreadsheet()
+    ws_name = st.secrets["sheets"].get("worksheet_base_name", "Banco")
+    try:
+        ws = sh.worksheet(ws_name)
+    except Exception as e:
+        st.error(f"Não encontrei a aba da base '{ws_name}' na planilha. Detalhe: {e}")
+        st.stop()
+    return ws
+
+@st.cache_resource
+def _get_ws():
+    """Worksheet dos inscritos (compartilhado)."""
+    sh = _get_spreadsheet()
+    ws_name = st.secrets["sheets"].get("worksheet_name", "inscritos")
+    try:
+        ws = sh.worksheet(ws_name)
+    except Exception:
+        # cria com cabeçalho padrão nome|pos|ts
+        ws = sh.add_worksheet(title=ws_name, rows=1000, cols=3)
+        ws.update("A1:C1", [["nome","pos","ts"]])
+    # garante cabeçalho
+    header = [h.strip().lower() for h in ws.row_values(1)]
+    if header != ["nome","pos","ts"]:
+        ws.update("A1:C1", [["nome","pos","ts"]])
+    return ws
+
+def _get_ws_log():
+    """Worksheet de log (opcional)."""
+    sh = _get_spreadsheet()
     title = st.secrets["sheets"].get("worksheet_log_name", "log")
     try:
         wslog = sh.worksheet(title)
@@ -38,8 +87,8 @@ def _get_ws_log():
         wslog = sh.add_worksheet(title=title, rows=1000, cols=5)
         wslog.update("A1:E1", [["ts","acao","nome","pos","origem"]])
         return wslog
-    header = wslog.row_values(1)
-    if [h.lower() for h in header] != ["ts","acao","nome","pos","origem"]:
+    header = [h.strip().lower() for h in wslog.row_values(1)]
+    if header != ["ts","acao","nome","pos","origem"]:
         wslog.update("A1:E1", [["ts","acao","nome","pos","origem"]])
     return wslog
 
@@ -51,35 +100,6 @@ def _append_log(acao: str, nome: str, pos: str, origem: str = "app"):
     except Exception:
         pass  # não quebra a UI se o log falhar
 
-
-# -----------------------------
-# Autorefresh a cada 10s
-# -----------------------------
-from streamlit_autorefresh import st_autorefresh
-st_autorefresh(interval=30_000, key="auto")
-
-# -----------------------------
-# Google Sheets (via Secrets)
-# -----------------------------
-import gspread
-from google.oauth2.service_account import Credentials
-
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
-
-@st.cache_resource
-def _get_ws():
-    creds = Credentials.from_service_account_info(
-        st.secrets["gcp_service_account"], scopes=SCOPES
-    )
-    gc = gspread.authorize(creds)
-    sh = gc.open_by_key(st.secrets["sheets"]["spreadsheet_key"])
-    ws = sh.worksheet(st.secrets["sheets"].get("worksheet_name", "inscritos"))
-    # garante cabeçalho nome|pos|ts
-    header = ws.row_values(1)
-    if [h.lower() for h in header] != ["nome", "pos", "ts"]:
-        ws.update("A1:C1", [["nome", "pos", "ts"]])
-    return ws
-
 @st.cache_data(ttl=10)
 def ler_inscritos_sheets() -> pd.DataFrame:
     """Lê a aba 'inscritos' do Sheets (cache 10s por instância)."""
@@ -90,10 +110,30 @@ def ler_inscritos_sheets() -> pd.DataFrame:
         df = pd.DataFrame(columns=["nome", "pos", "ts"])
     return df
 
+@st.cache_data(ttl=10)
+def ler_base_banco_sheets() -> pd.DataFrame:
+    """
+    Lê a base de jogadores da aba 'Banco' (ou 'worksheet_base_name' nos secrets)
+    da planilha 'Planilha_pelada'.
+    Espera colunas: Nome | Posição | Nota
+    """
+    ws = _get_ws_base()
+    values = ws.get_all_values()
+    if not values or len(values) < 1:
+        st.error("A aba da base está vazia. Preencha 'Nome', 'Posição' e 'Nota'.")
+        return pd.DataFrame(columns=["Nome", "Posição", "Nota"])
+
+    header = [c.strip() for c in values[0]]
+    df = pd.DataFrame(values[1:], columns=header)
+
+    # normalização e validação
+    df = _normaliza_e_valida_base(df)
+    return df
+
 def _upsert_inscrito(ws, nome: str, pos: str, ts: int):
     """Atualiza (se existir) ou insere (se não existir) (nome, pos, ts)."""
     try:
-        cell = ws.find(nome)  # procura o nome na planilha
+        cell = ws.find(nome)
     except Exception:
         cell = None
     if cell:
@@ -147,6 +187,12 @@ def set_presenca_sheet(df_base: pd.DataFrame, nome: str, vai: bool) -> tuple[boo
     return True, ""
 
 # -----------------------------
+# Autorefresh a cada 30s
+# -----------------------------
+from streamlit_autorefresh import st_autorefresh
+st_autorefresh(interval=30_000, key="auto")
+
+# -----------------------------
 # Utilitários (seus originais)
 # -----------------------------
 def normaliza_posicao(valor: str) -> str:
@@ -163,12 +209,13 @@ def normaliza_posicao(valor: str) -> str:
 
 def _normaliza_e_valida_base(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # normaliza cabeçalhos (tira espaços das pontas)
     cols = {c: c.strip() for c in df.columns}
     df.rename(columns=cols, inplace=True)
     obrig = {"Nome", "Posição", "Nota"}
     faltantes = obrig - set(df.columns)
     if faltantes:
-        raise ValueError(f"Colunas faltando: {', '.join(faltantes)}")
+        raise ValueError(f"Colunas faltando na aba da base (Banco): {', '.join(faltantes)}")
     df["Posição"] = df["Posição"].apply(normaliza_posicao)
     df["Nota"] = pd.to_numeric(df["Nota"], errors="coerce").fillna(0.0)
     return df
@@ -182,18 +229,6 @@ def contar_vagas(df_base: pd.DataFrame, inscritos: list[str]) -> tuple[int, int,
     ataque  = (df_insc["Posição"] == "Ataque").sum()
     goleiro = (df_insc["Posição"] == "Goleiro").sum()
     return int(defesa), int(ataque), int(goleiro)
-
-def carrega_base_local() -> pd.DataFrame | None:
-    if not os.path.exists(BASE_PATH):
-        st.error(f"Arquivo base não encontrado em: `{BASE_PATH}`")
-        return None
-    try:
-        df = pd.read_excel(BASE_PATH, sheet_name=SHEET_NAME)  # lê 'Banco'
-        df = _normaliza_e_valida_base(df)
-        return df
-    except Exception as e:
-        st.error(f"Erro ao ler '{BASE_PATH}' (aba '{SHEET_NAME}'): {e}")
-        return None
 
 def logica_divide_times(df: pd.DataFrame, seed: int | None = None) -> pd.DataFrame:
     df = df.copy()
@@ -258,7 +293,6 @@ def logica_divide_times(df: pd.DataFrame, seed: int | None = None) -> pd.DataFra
     df_final["Equipe"] = df_final["Time"].map(TIME_LABEL)
     return df_final
 
-
 def cria_download(df: pd.DataFrame, nome_arquivo: str = "Divisao_times.xlsx"):
     buffer = io.BytesIO()
     cols = [c for c in df.columns if c != "Nota"]
@@ -291,7 +325,6 @@ def limpar_inscritos_sheets():
     # invalida cache e força nova leitura no próximo rerun
     ler_inscritos_sheets.clear()
 
-
 # -----------------------------
 # Header
 # -----------------------------
@@ -306,12 +339,17 @@ if "so_visual" not in st.session_state:
     st.session_state.so_visual = False
 
 # -----------------------------
-# Carrega base local (Excel)
+# Carrega base do Google Sheets (Banco)
 # -----------------------------
 if st.session_state.df_base is None:
-    df_auto = carrega_base_local()
-    if df_auto is not None:
-        st.session_state.df_base = df_auto
+    try:
+        df_auto = ler_base_banco_sheets()
+        if df_auto is not None and not df_auto.empty:
+            st.session_state.df_base = df_auto
+        else:
+            st.warning("A base (aba 'Banco') está vazia.")
+    except Exception as e:
+        st.error(f"Erro ao ler a base do Google Sheets (aba 'Banco'): {e}")
 
 # -----------------------------
 # Config do organizador
@@ -319,13 +357,18 @@ if st.session_state.df_base is None:
 with st.expander("⚙️ Configuração do organizador", expanded=False):
     col_a, col_b, col_c = st.columns([1, 1, 1])
 
-    # Recarregar a base Excel
+    # Recarregar a base Sheets
     with col_a:
-        if st.button("🔄 Recarregar base do arquivo"):
-            df_auto = carrega_base_local()
-            if df_auto is not None:
-                st.session_state.df_base = df_auto
-                st.success("Base recarregada.")
+        if st.button("🔄 Recarregar base (Sheets)"):
+            try:
+                df_auto = ler_base_banco_sheets()
+                if df_auto is not None and not df_auto.empty:
+                    st.session_state.df_base = df_auto
+                    st.success("Base recarregada do Sheets (aba 'Banco').")
+                else:
+                    st.warning("A base (aba 'Banco') está vazia.")
+            except Exception as e:
+                st.error(f"Erro ao recarregar a base do Sheets: {e}")
 
     # Travar/destravar check-ins (modo visualização)
     with col_b:
@@ -337,19 +380,18 @@ with st.expander("⚙️ Configuração do organizador", expanded=False):
     # LIMPAR inscritos no Google Sheets
     with col_c:
         if st.button("🧹 Limpar inscritos (Sheets)"):
-            limpar_inscritos_sheets()     # <- chama o helper que limpa A2:C...
+            limpar_inscritos_sheets()
             st.success("Inscritos limpos para a próxima pelada.")
             st.rerun()
-
 
 # -----------------------------
 # Check-in em TABELA (compartilhado via Sheets)
 # -----------------------------
 st.subheader("📝 Check-in dos jogadores")
 
-# Fallback: se não houver Excel, ainda exibimos os inscritos do Sheets
-if st.session_state.df_base is None:
-    st.warning("Base Excel não carregada. Exibindo apenas inscritos do Google Sheets.")
+# Se não houver base, exibe apenas inscritos do Sheets
+if st.session_state.df_base is None or st.session_state.df_base.empty:
+    st.warning("Base (Banco) não carregada. Exibindo apenas inscritos do Google Sheets.")
     df_inscritos_sheet = ler_inscritos_sheets()
     if df_inscritos_sheet.empty:
         st.info("Ainda não há inscritos salvos.")
@@ -360,7 +402,7 @@ if st.session_state.df_base is None:
         )
     st.stop()
 
-# Com base local, a UI completa:
+# Com base carregada, a UI completa:
 df_base = st.session_state.df_base
 df_sheet = ler_inscritos_sheets()
 inscritos_compart = df_sheet["nome"].tolist()
@@ -429,15 +471,14 @@ if not df_inscritos.empty:
     score = indice_anonimo_equilibrio(df_times)
     mensagem = "Times equilibrados" if score >= 80 else ("Leve vantagem para um dos lados" if score >= 60 else "Desequilíbrio notável")
     st.metric(
-    "Índice anônimo de equilíbrio (0–100)",
-    f"{score}",
-    help=(" **Como calculamos o índice de equilíbrio (0–100):** "
-        "Sejam $S_\\text{preto}$ e $S_\\text{laranja}$ as somas das *Notas* dos jogadores de cada time. "
-        "Calculamos `Índice = 100 × (1 − |S_preto − S_laranja| / (S_preto + S_laranja))`. "
-        "Quanto mais próximo de **100**, mais equilibrados os times; valores menores indicam maior diferença."
+        "Índice anônimo de equilíbrio (0–100)",
+        f"{score}",
+        help=(" **Como calculamos o índice de equilíbrio (0–100):** "
+              "Sejam $S_\\text{preto}$ e $S_\\text{laranja}$ as somas das *Notas* dos jogadores de cada time. "
+              "Calculamos `Índice = 100 × (1 − |S_preto − S_laranja| / (S_preto + S_laranja))`. "
+              "Quanto mais próximo de **100**, mais equilibrados os times; valores menores indicam maior diferença."
         )
     )
-    
     st.caption(f"_Leitura rápida_: {mensagem}.")
 
     col1, col2 = st.columns(2)
@@ -448,7 +489,6 @@ if not df_inscritos.empty:
         if bloc.empty:
             col.info("_Sem jogadores ainda._")
         else:
-            # ordem desejada de exibição
             _pos_ord = {"Goleiro": 0, "Defesa": 1, "Ataque": 2}
             bloc["__pos_ord"] = bloc["Posição"].map(_pos_ord).fillna(99).astype(int)
             bloc = bloc.sort_values(by=["__pos_ord", "Nome"]).drop(columns=["__pos_ord"])
